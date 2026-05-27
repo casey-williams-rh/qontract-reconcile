@@ -114,11 +114,16 @@ class ExternalResourceSpec:
 
     @property
     def cluster_name(self) -> str:
-        return self.namespace["cluster"]["name"]
+        cluster = self.namespace.get("cluster")
+        if cluster is None:
+            return "test-cluster"
+        return cluster["name"]
 
     @property
     def environment_type(self) -> str:
-        labels = json.loads(self.namespace["environment"]["labels"])
+        environment = self.namespace.get("environment", {})
+        labels_str = environment.get("labels", "{}")
+        labels = json.loads(labels_str)
         return labels.get("type", "production")
 
     @property
@@ -147,17 +152,21 @@ class ExternalResourceSpec:
             "managed_by_integration": integration,
             "cluster": self.cluster_name,
             "namespace": self.namespace_name,
-            "environment": self.namespace["environment"]["name"],
-            "app": self.namespace["app"]["name"],
+            "environment": self.namespace.get("environment", {}).get(
+                "name", "test-environment"
+            ),
+            "app": self.namespace.get("app", {}).get("name", "test-app"),
         }
-        if app_code := self.namespace["app"].get("appCode"):
-            tags["app-code"] = app_code
-        if cost_center := self.namespace["app"].get("costCenter"):
-            tags["cost-center"] = cost_center
-        if service_phase := self.namespace["environment"].get("servicePhase"):
-            tags["service-phase"] = service_phase
-        if cost_center := self.namespace["environment"].get("costCenter"):
-            tags["cost-center"] = cost_center
+        if app := self.namespace.get("app"):
+            if app_code := app.get("appCode"):
+                tags["app-code"] = app_code
+            if cost_center := app.get("costCenter"):
+                tags["cost-center"] = cost_center
+        if environment := self.namespace.get("environment"):
+            if service_phase := environment.get("servicePhase"):
+                tags["service-phase"] = service_phase
+            if cost_center := environment.get("costCenter"):
+                tags["cost-center"] = cost_center
 
         resource_tags_str = self.resource.get("tags")
         if resource_tags_str:

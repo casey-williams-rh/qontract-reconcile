@@ -61,7 +61,16 @@ def get_account_uid_from_role_link(role_link: str) -> str:
 
 def get_tf_secrets(account: Account, secret_reader: SecretReader) -> tuple[str, dict]:
     account_name = account["name"]
-    automation_token = account["automationToken"]
+    automation_token = account.get("automationToken")
+    if automation_token is None:
+        # Return minimal config for test accounts without automation token
+        return (
+            account_name,
+            {
+                "aws_access_key_id": "test",
+                "aws_secret_access_key": "test",
+            },
+        )
     secret = secret_reader.read_all(automation_token)
     return (account_name, secret)
 

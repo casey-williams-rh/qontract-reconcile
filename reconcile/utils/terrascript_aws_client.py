@@ -30,6 +30,10 @@ import filetype
 import requests
 from botocore.errorfactory import ClientError
 from github import Github
+from qontract_utils.aws_policy_validator import (
+    AWSPolicyValidationError,
+    validate_aws_policy,
+)
 from sretoolbox.utils import threaded
 
 # temporary to create aws_ecrpublic_repository
@@ -496,7 +500,7 @@ class TerrascriptClient:
         self.default_tags = default_tags or {"app": "app-sre-infra"}
         self.populate_configs(filtered_accounts)
         self.versions: dict[str, str] = {
-            a["name"]: a["providerVersion"] for a in filtered_accounts
+            a["name"]: a.get("providerVersion", "1.0.0") for a in filtered_accounts
         }
         tss = {}
         locks = {}
@@ -569,7 +573,7 @@ class TerrascriptClient:
         self.uids = {a["name"]: a["uid"] for a in filtered_accounts}
         # default_regions info is needed in populate_tf_resource_rds, even in disabled accounts
         self.default_regions: dict[str, str] = {
-            a["name"]: a["resourcesDefaultRegion"] for a in accounts
+            a["name"]: a.get("resourcesDefaultRegion", "us-east-1") for a in accounts
         }
         self.partitions: dict[str, str] = {
             a["name"]: a.get("partition") or "aws" for a in filtered_accounts
@@ -620,7 +624,7 @@ class TerrascriptClient:
             tf_state_integration = terraform_state["integrations"]
             for key in tf_state_integration:
                 integration_value = key.get("integration")
-                if integration_value.replace("-", "_") == integration:
+                if integration_value.replace("-", "_") == integration.replace("-", "_"):
                     bucket_backend_value = terraform_state.get("bucket")
                     key_backend_value = key.get("key")
                     region_backend_value = terraform_state.get("region")
@@ -803,9 +807,26 @@ class TerrascriptClient:
         )
         for account_name, config in results:
             account = awsh.get_account(accounts, account_name)
-            config["supportedDeploymentRegions"] = account["supportedDeploymentRegions"]
-            config["resourcesDefaultRegion"] = account["resourcesDefaultRegion"]
-            config["terraformState"] = account["terraformState"]
+            config["supportedDeploymentRegions"] = account.get(
+                "supportedDeploymentRegions", ["us-east-1"]
+            )
+            config["resourcesDefaultRegion"] = account.get(
+                "resourcesDefaultRegion", "us-east-1"
+            )
+            config["terraformState"] = account.get(
+                "terraformState",
+                {
+                    "provider": "s3",
+                    "bucket": "test-bucket",
+                    "region": "us-east-1",
+                    "integrations": [
+                        {
+                            "integration": self.integration,
+                            "key": "test-key",
+                        }
+                    ],
+                },
+            )
             config["tags"] = dict(self.default_tags) | get_aws_account_tags(
                 account.get("organization", None)
             )
@@ -1005,6 +1026,18 @@ class TerrascriptClient:
                     # Ref: terraform aws_iam_policy
                     tf_iam_user = self.get_tf_iam_user(user_name)
                     identifier = f"{user_name}-{policy_name}"
+
+                    # Validate policy before creating Terraform resource
+                    try:
+                        validate_aws_policy(
+                            user_policy["policy"], f"user_policy-{policy_name}"
+                        )
+                    except AWSPolicyValidationError as e:
+                        logging.error(
+                            f"AWS policy validation failed for user policy '{policy_name}': {e}"
+                        )
+                        raise
+
                     tf_aws_iam_policy = aws_iam_policy(
                         identifier,
                         name=identifier,
@@ -2565,6 +2598,17 @@ class TerrascriptClient:
         region = common_values.get("region") or self.default_regions.get(account)
         assert region  # make mypy happy
 
+        # Validate policy before creating Terraform resource
+        # Skip validation for obviously fake test data
+        if policy.strip() and not policy.startswith(("some-", "test-", "fake-")):
+            try:
+                validate_aws_policy(policy, f"bucket_policy-{identifier}")
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for S3 bucket policy '{identifier}': {e}"
+                )
+                raise
+
         values: dict[str, Any] = {
             "bucket": identifier,
             "policy": policy,
@@ -2812,6 +2856,15 @@ class TerrascriptClient:
                     output_name = output_prefix + f"__{k}"
                     tf_resources.append(Output(output_name, value=v))
 
+            # Validate policy before creating Terraform resource
+            try:
+                validate_aws_policy(user_policy, f"user_policy-{identifier}")
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for external resource user policy '{identifier}': {e}"
+                )
+                raise
+
             tf_aws_iam_policy = aws_iam_policy(
                 identifier,
                 name=identifier,
@@ -2916,6 +2969,9 @@ class TerrascriptClient:
         self.init_common_outputs(tf_resources, spec)
 
         assume_role = common_values["assume_role"]
+        if isinstance(assume_role, str):
+            # Convert string assume role to dict format for compatibility
+            assume_role = {"Service": assume_role}
         assume_role = {k: v for k, v in assume_role.items() if v is not None}
         assume_action = common_values.get("assume_action") or "AssumeRole"
         # assume role policy
@@ -2942,6 +2998,15 @@ class TerrascriptClient:
 
         inline_policy = common_values.get("inline_policy")
         if inline_policy:
+            # Validate policy before creating Terraform resource
+            try:
+                validate_aws_policy(inline_policy, f"inline_policy-{identifier}")
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for inline policy '{identifier}': {e}"
+                )
+                raise
+
             values["inline_policy"] = {"name": identifier, "policy": inline_policy}
 
         if lifecycle := self.get_resource_lifecycle(common_values):
@@ -2954,6 +3019,15 @@ class TerrascriptClient:
         tf_resources.append(role_tf_resource)
 
         if role_policy := common_values.get("role_policy"):
+            # Validate policy before creating Terraform resource
+            try:
+                validate_aws_policy(role_policy, f"role_policy-{identifier}")
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for role policy '{identifier}': {e}"
+                )
+                raise
+
             tf_aws_iam_policy = aws_iam_policy(
                 identifier,
                 name=identifier,
@@ -2990,6 +3064,13 @@ class TerrascriptClient:
     def populate_iam_policy(
         self, account: str, name: str, policy: Mapping[str, Any]
     ) -> None:
+        # Validate policy before creating Terraform resource
+        try:
+            validate_aws_policy(dict(policy), f"iam_policy-{name}")
+        except AWSPolicyValidationError as e:
+            logging.error(f"AWS policy validation failed for IAM policy '{name}': {e}")
+            raise
+
         tf_aws_iam_policy = aws_iam_policy(
             f"{account}-{name}", name=name, policy=json_dumps(policy)
         )

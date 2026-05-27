@@ -5,6 +5,11 @@ from typing import (
     Any,
 )
 
+from qontract_utils.aws_policy_validator import (
+    AWSPolicyValidationError,
+    validate_aws_policy,
+)
+
 from reconcile import (
     queries,
     typed_queries,
@@ -110,6 +115,25 @@ def _filter_participating_aws_accounts(
     return [a for a in accounts if a["name"] in participating_aws_account_names]
 
 
+def _validate_aws_policies_in_roles(roles: Iterable[Mapping[str, Any]]) -> None:
+    """Validate all AWS policies in roles before processing."""
+    for role in roles:
+        user_policies: Iterable[Mapping[str, Any]] = role.get("user_policies") or []
+        for user_policy in user_policies:
+            policy_name = user_policy.get("name", "unknown")
+            policy_document = user_policy.get("policy")
+            if policy_document is not None and policy_document.strip():
+                try:
+                    validate_aws_policy(policy_document, f"user_policy-{policy_name}")
+                except AWSPolicyValidationError as e:
+                    # Re-raise with additional context while preserving original errors
+                    context_message = f"Policy validation failed in terraform_users integration for role '{role.get('name', 'unknown')}' user policy '{policy_name}'"
+                    enhanced_errors = [context_message] + list(e.errors)
+                    raise AWSPolicyValidationError(
+                        f"user_policy-{policy_name}", enhanced_errors
+                    ) from e
+
+
 def setup(
     print_to_file: str | None,
     thread_pool_size: int,
@@ -125,6 +149,9 @@ def setup(
     ]
     roles = get_tf_roles()
     participating_aws_accounts = _filter_participating_aws_accounts(accounts, roles)
+
+    # Validate all AWS policies before processing
+    _validate_aws_policies_in_roles(roles)
 
     settings = queries.get_app_interface_settings()
     try:
