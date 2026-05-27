@@ -681,7 +681,7 @@ def s3_spec_with_bucket_policy() -> ExternalResourceSpec:
     resource = {
         "identifier": "s3-bucket",
         "provider": "s3",
-        "bucket_policy": "some-bucket-policy",
+        "bucket_policy": '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::s3-bucket/*"}]}',
         "region": "us-east-1",
     }
     return build_s3_spec(resource)
@@ -692,7 +692,7 @@ def expected_s3_bucket_policy() -> aws_s3_bucket_policy:
     return aws_s3_bucket_policy(
         "s3-bucket",
         bucket="s3-bucket",
-        policy="some-bucket-policy",
+        policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::s3-bucket/*"}]}',
         depends_on=["aws_s3_bucket.s3-bucket"],
     )
 
@@ -704,6 +704,13 @@ def test_populate_tf_resource_s3_with_bucket_policy(
     expected_s3_default_bucket: aws_s3_bucket,
     expected_s3_bucket_policy: aws_s3_bucket_policy,
 ) -> None:
+    # Mock Access Analyzer for policy validation
+    mock_aa = MagicMock()
+    mock_paginator = MagicMock()
+    mock_aa.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [{"findings": []}]
+    mocker.patch.object(ts, "_get_accessanalyzer_client", return_value=mock_aa)
+
     mocked_add_resources = mocker.patch.object(ts, "add_resources")
 
     bucket_tf_resource = ts.populate_tf_resource_s3(s3_spec_with_bucket_policy)
@@ -721,7 +728,7 @@ def s3_spec_with_bucket_policy_and_region() -> ExternalResourceSpec:
     resource = {
         "identifier": "s3-bucket",
         "provider": "s3",
-        "bucket_policy": "some-bucket-policy",
+        "bucket_policy": '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::s3-bucket/*"}]}',
         "region": "us-west-2",
     }
     return build_s3_spec(resource)
@@ -764,7 +771,7 @@ def expected_s3_bucket_policy_with_region() -> aws_s3_bucket_policy:
     return aws_s3_bucket_policy(
         "s3-bucket",
         bucket="s3-bucket",
-        policy="some-bucket-policy",
+        policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::s3-bucket/*"}]}',
         depends_on=["aws_s3_bucket.s3-bucket"],
         provider="aws.us-west-2",
     )
@@ -777,6 +784,13 @@ def test_populate_tf_resource_s3_with_bucket_policy_and_different_region(
     expected_s3_bucket_with_region: aws_s3_bucket,
     expected_s3_bucket_policy_with_region: aws_s3_bucket_policy,
 ) -> None:
+    # Mock Access Analyzer for policy validation
+    mock_aa = MagicMock()
+    mock_paginator = MagicMock()
+    mock_aa.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [{"findings": []}]
+    mocker.patch.object(ts, "_get_accessanalyzer_client", return_value=mock_aa)
+
     mocked_add_resources = mocker.patch.object(ts, "add_resources")
     mocker.patch.object(ts, "_multiregion_account", return_value=True)
 
@@ -1791,6 +1805,13 @@ def test_populate_tf_resource_s3_cloudfront_with_bucket_policy_string(
     ts: TerrascriptClient,
     s3_cloudfront_spec_with_bucket_policy_string: ExternalResourceSpec,
 ) -> None:
+    # Mock Access Analyzer for policy validation
+    mock_aa = MagicMock()
+    mock_paginator = MagicMock()
+    mock_aa.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [{"findings": []}]
+    mocker.patch.object(ts, "_get_accessanalyzer_client", return_value=mock_aa)
+
     mocked_add_resources = mocker.patch.object(ts, "add_resources")
     custom_policy = json.dumps({
         "Version": "2012-10-17",
@@ -1849,6 +1870,13 @@ def test_populate_tf_resource_s3_cloudfront_with_bucket_policy_multiple_statemen
     mocker: MockerFixture,
     ts: TerrascriptClient,
 ) -> None:
+    # Mock Access Analyzer for policy validation
+    mock_aa = MagicMock()
+    mock_paginator = MagicMock()
+    mock_aa.get_paginator.return_value = mock_paginator
+    mock_paginator.paginate.return_value = [{"findings": []}]
+    mocker.patch.object(ts, "_get_accessanalyzer_client", return_value=mock_aa)
+
     mocked_add_resources = mocker.patch.object(ts, "add_resources")
     custom_policy = json.dumps({
         "Version": "2012-10-17",

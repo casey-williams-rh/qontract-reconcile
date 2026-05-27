@@ -11,6 +11,7 @@ import re
 import string
 import tempfile
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass, field
 from ipaddress import (
     ip_address,
@@ -26,10 +27,15 @@ from typing import (
 )
 
 import anymarkup
+import boto3
 import filetype
 import requests
 from botocore.errorfactory import ClientError
 from github import Github
+from qontract_utils.aws_policy_validator import (
+    AWSPolicyValidationError,
+    validate_aws_policy,
+)
 from sretoolbox.utils import threaded
 
 # temporary to create aws_ecrpublic_repository
@@ -458,6 +464,17 @@ class ProviderExcludedError(Exception):
         )
 
 
+class MissingProviderVersionError(Exception):
+    """Raised when a Terraform AWS provider version is not specified."""
+
+    def __init__(self, account_name: str) -> None:
+        super().__init__(
+            f"AWS provider version not specified for account '{account_name}'. "
+            f"Please add a 'providerVersion' field to the account configuration. "
+            f"Example: 'providerVersion: \"3.0.0\"'"
+        )
+
+
 class TerrascriptClient:
     """
     At a high-level, this class is responsible for generating Terraform configuration in
@@ -495,9 +512,12 @@ class TerrascriptClient:
         self.configs: dict[str, dict] = {}
         self.default_tags = default_tags or {"app": "app-sre-infra"}
         self.populate_configs(filtered_accounts)
-        self.versions: dict[str, str] = {
-            a["name"]: a["providerVersion"] for a in filtered_accounts
-        }
+        self.versions: dict[str, str] = {}
+        for a in filtered_accounts:
+            provider_version = a.get("providerVersion")
+            if not isinstance(provider_version, str) or not provider_version:
+                raise MissingProviderVersionError(a["name"])
+            self.versions[a["name"]] = provider_version
         tss = {}
         locks = {}
         self.supported_regions = {}
@@ -568,9 +588,13 @@ class TerrascriptClient:
         self.accounts = {a["name"]: a for a in filtered_accounts}
         self.uids = {a["name"]: a["uid"] for a in filtered_accounts}
         # default_regions info is needed in populate_tf_resource_rds, even in disabled accounts
-        self.default_regions: dict[str, str] = {
-            a["name"]: a["resourcesDefaultRegion"] for a in accounts
-        }
+        self.default_regions: dict[str, str] = {}
+        for a in accounts:
+            region = a.get("resourcesDefaultRegion")
+            if not isinstance(region, str) or not region:
+                msg = f"Account {a['name']} missing or invalid 'resourcesDefaultRegion'"
+                raise ValueError(msg)
+            self.default_regions[a["name"]] = region
         self.partitions: dict[str, str] = {
             a["name"]: a.get("partition") or "aws" for a in filtered_accounts
         }
@@ -589,6 +613,8 @@ class TerrascriptClient:
         self.jenkins_map: dict[str, JenkinsApi] = {}
         self.jenkins_lock = Lock()
         self._resource_cache: dict[str, dict[str, str]] = {}
+        self._accessanalyzer_clients: dict[tuple[str, str], Any] = {}
+        self._accessanalyzer_clients_lock = Lock()
         if prefetch_resources_by_schemas:
             for schema in prefetch_resources_by_schemas:
                 self._resource_cache.update(self.prefetch_resources(schema))
@@ -602,6 +628,10 @@ class TerrascriptClient:
     def cleanup(self) -> None:
         if self.gitlab is not None:
             self.gitlab.cleanup()
+        for client in self._accessanalyzer_clients.values():
+            with suppress(Exception):
+                client.close()
+        self._accessanalyzer_clients.clear()
 
     @staticmethod
     def state_bucket_for_account(
@@ -620,7 +650,9 @@ class TerrascriptClient:
             tf_state_integration = terraform_state["integrations"]
             for key in tf_state_integration:
                 integration_value = key.get("integration")
-                if integration_value.replace("-", "_") == integration:
+                if isinstance(integration_value, str) and integration_value.replace(
+                    "-", "_"
+                ) == integration.replace("-", "_"):
                     bucket_backend_value = terraform_state.get("bucket")
                     key_backend_value = key.get("key")
                     region_backend_value = terraform_state.get("region")
@@ -803,8 +835,18 @@ class TerrascriptClient:
         )
         for account_name, config in results:
             account = awsh.get_account(accounts, account_name)
+            if "supportedDeploymentRegions" not in account:
+                msg = f"Account {account_name} missing required field 'supportedDeploymentRegions'"
+                raise ValueError(msg)
+            region = account.get("resourcesDefaultRegion")
+            if not isinstance(region, str) or not region:
+                msg = f"Account {account_name} missing or invalid 'resourcesDefaultRegion'"
+                raise ValueError(msg)
+            if "terraformState" not in account:
+                msg = f"Account {account_name} missing required field 'terraformState'"
+                raise ValueError(msg)
             config["supportedDeploymentRegions"] = account["supportedDeploymentRegions"]
-            config["resourcesDefaultRegion"] = account["resourcesDefaultRegion"]
+            config["resourcesDefaultRegion"] = region
             config["terraformState"] = account["terraformState"]
             config["tags"] = dict(self.default_tags) | get_aws_account_tags(
                 account.get("organization", None)
@@ -813,6 +855,33 @@ class TerrascriptClient:
 
     def _get_partition(self, account: str) -> str:
         return self.partitions.get(account) or "aws"
+
+    def _get_accessanalyzer_client(
+        self, account_name: str, region: str | None = None
+    ) -> Any:
+        """Get a cached AWS Access Analyzer client for the specified account.
+
+        Clients are cached by (account_name, region) and closed in cleanup().
+
+        Args:
+            account_name: Name of the AWS account
+            region: AWS region (defaults to account's resourcesDefaultRegion)
+
+        Returns:
+            boto3 Access Analyzer client
+        """
+        config = self.configs[account_name]
+        region_name = region or config["resourcesDefaultRegion"]
+        key = (account_name, region_name)
+        with self._accessanalyzer_clients_lock:
+            if key not in self._accessanalyzer_clients:
+                self._accessanalyzer_clients[key] = boto3.client(
+                    "accessanalyzer",
+                    aws_access_key_id=config["aws_access_key_id"],
+                    aws_secret_access_key=config["aws_secret_access_key"],
+                    region_name=region_name,
+                )
+            return self._accessanalyzer_clients[key]
 
     @staticmethod
     def get_tf_iam_group(group_name: str) -> aws_iam_group:
@@ -999,12 +1068,14 @@ class TerrascriptClient:
                     continue
                 policy_name = user_policy["name"]
                 account_name = user_policy["account"]["name"]
+
                 for user in users:
                     user_name = self._get_aws_username(user)
 
                     # Ref: terraform aws_iam_policy
                     tf_iam_user = self.get_tf_iam_user(user_name)
                     identifier = f"{user_name}-{policy_name}"
+
                     tf_aws_iam_policy = aws_iam_policy(
                         identifier,
                         name=identifier,
@@ -2565,6 +2636,22 @@ class TerrascriptClient:
         region = common_values.get("region") or self.default_regions.get(account)
         assert region  # make mypy happy
 
+        # Validate policy before creating Terraform resource
+        if policy.strip() and "${" not in policy:
+            try:
+                client = self._get_accessanalyzer_client(account, region)
+                validate_aws_policy(
+                    client,
+                    policy,
+                    f"bucket_policy-{identifier}",
+                    "RESOURCE_POLICY",
+                )
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for S3 bucket policy '{identifier}': {e}"
+                )
+                raise
+
         values: dict[str, Any] = {
             "bucket": identifier,
             "policy": policy,
@@ -2812,6 +2899,21 @@ class TerrascriptClient:
                     output_name = output_prefix + f"__{k}"
                     tf_resources.append(Output(output_name, value=v))
 
+            # Validate policy before creating Terraform resource
+            try:
+                client = self._get_accessanalyzer_client(account)
+                validate_aws_policy(
+                    client,
+                    user_policy,
+                    f"user_policy-{identifier}",
+                    "IDENTITY_POLICY",
+                )
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for external resource user policy '{identifier}': {e}"
+                )
+                raise
+
             tf_aws_iam_policy = aws_iam_policy(
                 identifier,
                 name=identifier,
@@ -2916,6 +3018,14 @@ class TerrascriptClient:
         self.init_common_outputs(tf_resources, spec)
 
         assume_role = common_values["assume_role"]
+        if isinstance(assume_role, str):
+            # Convert string assume role to dict format for compatibility
+            if assume_role.startswith("arn:") or re.fullmatch(r"\d{12}", assume_role):
+                # ARNs and 12-digit account IDs use AWS principal type
+                assume_role = {"AWS": assume_role}
+            else:
+                # Service names should use Service principal type
+                assume_role = {"Service": assume_role}
         assume_role = {k: v for k, v in assume_role.items() if v is not None}
         assume_action = common_values.get("assume_action") or "AssumeRole"
         # assume role policy
@@ -2942,6 +3052,21 @@ class TerrascriptClient:
 
         inline_policy = common_values.get("inline_policy")
         if inline_policy:
+            # Validate policy before creating Terraform resource
+            try:
+                client = self._get_accessanalyzer_client(account)
+                validate_aws_policy(
+                    client,
+                    inline_policy,
+                    f"inline_policy-{identifier}",
+                    "IDENTITY_POLICY",
+                )
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for inline policy '{identifier}': {e}"
+                )
+                raise
+
             values["inline_policy"] = {"name": identifier, "policy": inline_policy}
 
         if lifecycle := self.get_resource_lifecycle(common_values):
@@ -2954,6 +3079,21 @@ class TerrascriptClient:
         tf_resources.append(role_tf_resource)
 
         if role_policy := common_values.get("role_policy"):
+            # Validate policy before creating Terraform resource
+            try:
+                client = self._get_accessanalyzer_client(account)
+                validate_aws_policy(
+                    client,
+                    role_policy,
+                    f"role_policy-{identifier}",
+                    "IDENTITY_POLICY",
+                )
+            except AWSPolicyValidationError as e:
+                logging.error(
+                    f"AWS policy validation failed for role policy '{identifier}': {e}"
+                )
+                raise
+
             tf_aws_iam_policy = aws_iam_policy(
                 identifier,
                 name=identifier,
@@ -2990,6 +3130,19 @@ class TerrascriptClient:
     def populate_iam_policy(
         self, account: str, name: str, policy: Mapping[str, Any]
     ) -> None:
+        # Validate policy before creating Terraform resource
+        try:
+            client = self._get_accessanalyzer_client(account)
+            validate_aws_policy(
+                client,
+                dict(policy),
+                f"iam_policy-{name}",
+                "IDENTITY_POLICY",
+            )
+        except AWSPolicyValidationError as e:
+            logging.error(f"AWS policy validation failed for IAM policy '{name}': {e}")
+            raise
+
         tf_aws_iam_policy = aws_iam_policy(
             f"{account}-{name}", name=name, policy=json_dumps(policy)
         )

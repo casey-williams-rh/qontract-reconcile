@@ -1,8 +1,14 @@
 import sys
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from textwrap import indent
 from typing import (
     Any,
+)
+
+import boto3
+from qontract_utils.aws_policy_validator import (
+    validate_aws_policy,
 )
 
 from reconcile import (
@@ -110,6 +116,75 @@ def _filter_participating_aws_accounts(
     return [a for a in accounts if a["name"] in participating_aws_account_names]
 
 
+def _validate_aws_policies_in_roles(
+    roles: Iterable[Mapping[str, Any]],
+    accounts: Iterable[Mapping[str, Any]],
+    settings: Mapping[str, Any] | None,
+) -> None:
+    """Validate all AWS policies in roles before processing.
+
+    Args:
+        roles: Roles containing user policies to validate
+        accounts: AWS accounts with credentials
+        settings: App-interface settings for secret reader
+    """
+    # Build account lookup by name
+    accounts_by_name = {acc["name"]: acc for acc in accounts}
+
+    # Cache for AccessAnalyzer clients by account
+    clients: dict[str, Any] = {}
+
+    def get_client(account_name: str) -> Any:
+        """Get or create AccessAnalyzer client for an account."""
+        if account_name not in clients:
+            account = accounts_by_name.get(account_name)
+            if not account:
+                msg = f"Account '{account_name}' not found in participating accounts"
+                raise ValueError(msg)
+
+            # Get credentials from vault
+            secret_reader = SecretReader(settings=settings)
+            secret = secret_reader.read_all(account["automationToken"])
+
+            region = account.get("resourcesDefaultRegion", "us-east-1")
+            clients[account_name] = boto3.client(
+                "accessanalyzer",
+                aws_access_key_id=secret["aws_access_key_id"],
+                aws_secret_access_key=secret["aws_secret_access_key"],
+                region_name=region,
+            )
+        return clients[account_name]
+
+    try:
+        for role in roles:
+            user_policies: Iterable[Mapping[str, Any]] = role.get("user_policies") or []
+            for user_policy in user_policies:
+                policy_name = user_policy.get("name", "unknown")
+                policy_document = user_policy.get("policy")
+                account_name = user_policy.get("account", {}).get("name")
+
+                if user_policy.get("account", {}).get("sso") is True:
+                    continue
+                if not account_name or account_name not in accounts_by_name:
+                    continue
+
+                if policy_document is not None and (
+                    isinstance(policy_document, dict)
+                    or (isinstance(policy_document, str) and policy_document.strip())
+                ):
+                    client = get_client(account_name)
+                    validate_aws_policy(
+                        client,
+                        policy_document,
+                        f"user_policy-{policy_name}",
+                        "IDENTITY_POLICY",
+                    )
+    finally:
+        for client in clients.values():
+            with suppress(Exception):
+                client.close()
+
+
 def setup(
     print_to_file: str | None,
     thread_pool_size: int,
@@ -127,6 +202,9 @@ def setup(
     participating_aws_accounts = _filter_participating_aws_accounts(accounts, roles)
 
     settings = queries.get_app_interface_settings()
+
+    # Validate all AWS policies before processing
+    _validate_aws_policies_in_roles(roles, participating_aws_accounts, settings)
     try:
         default_tags = get_settings().default_tags
     except ValueError:
